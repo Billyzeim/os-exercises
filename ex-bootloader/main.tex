@@ -1,0 +1,576 @@
+%----------------------------------------------------------------------------------------
+%   PACKAGES AND OTHER DOCUMENT CONFIGURATIONS
+%----------------------------------------------------------------------------------------
+
+\documentclass[18pt]{extarticle}
+
+\input{structure.cls} % Include the file specifying the document structure and custom commands
+
+%----------------------------------------------------------------------------------------
+%   ASSIGNMENT INFORMATION
+%----------------------------------------------------------------------------------------
+
+\title{Εισαγωγή στο Bootloader και στη Διαδικασία Εκκίνησης Λειτουργικού Συστήματος\\
+Λειτουργικά Συστήματα (ECE ΓΚ702)} % Title of the assignment
+
+\author{
+    \footnotesize Χρήστος Φείδας\\
+    \footnotesize \src{fidas@upatras.gr} \and
+    \footnotesize Ευάγγελος Λάμπρου\\
+    \footnotesize \src{e.lamprou@upnet.gr} \and
+    \footnotesize Ζεϊμπέκης Βασίλειος\\
+    \footnotesize \src{bzeimp@gmail.com}
+} % Author name and email address
+
+\date{University of Patras, Department of Electrical and Computer Engineering} % University, school and/or department name(s) and a date
+
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+
+%----------------------------------------------------------------------------------------
+
+\begin{document}
+
+\pagestyle{fancy}
+\fancyhf{} % sets both header and footer to nothing
+\renewcommand{\headrulewidth}{0pt}
+\fancyhead{} % clear all header fields
+\fancyfoot{} % clear all footer fields
+\fancyfoot[L]{Χρήστος Φείδας, Ευάγγελος Λάμπρου, Ζεϊμπέκης Βασίλειος}
+\fancyfoot[R]{\thepage}
+
+\maketitle
+
+%----------------------------------------------------------------------------------------
+%   INTRODUCTION
+%----------------------------------------------------------------------------------------
+
+\section{Εισαγωγή}
+
+Σε αυτό το εργαστήριο θα μελετήσουμε τα θεμελιώδη στάδια της εκκίνησης (boot process) ενός
+λειτουργικού συστήματος σε \textbf{x86 32-bit} αρχιτεκτονική με \textbf{BIOS}.
+
+Ο bootloader είναι ο \textbf{πρώτος κώδικας δικής μας ευθύνης} που εκτελείται μετά το BIOS, σε ένα
+περιορισμένο περιβάλλον (Real Mode), και έχει ως βασικό στόχο να:
+\begin{itemize}
+    \item θέσει το σύστημα σε προβλέψιμη κατάσταση (segments, stack),
+    \item φορτώσει τον πυρήνα (kernel) από τον δίσκο στη μνήμη,
+    \item προετοιμάσει τη CPU ώστε να εκτελέσει 32-bit κώδικα (Protected Mode),
+    \item μεταφέρει τον έλεγχο στον kernel.
+\end{itemize}
+
+Μπορείτε να βρείτε το συνοδευτικό βιβλίο του Skyl-OS \href{https://github.com/Billyzeim/Skyl-OS/blob/main/docs/book/main.pdf}{εδώ}.
+
+\subsection{Σημείωση για το αντικείμενο}
+
+Ό,τι περιγράφεται παρακάτω αφορά \textbf{legacy BIOS boot} και \textbf{32-bit x86}. Σύγχρονα συστήματα
+χρησιμοποιούν συχνά UEFI, όμως για εκπαιδευτικούς λόγους το BIOS είναι ιδανικό ώστε να δούμε με
+καθαρό τρόπο τα βασικά επίπεδα αφαίρεσης και τις αρχιτεκτονικές δεσμεύσεις.
+
+%----------------------------------------------------------------------------------------
+%   2.1 REAL MODE
+%----------------------------------------------------------------------------------------
+
+\section{Booting in Real Mode}
+
+Για να κατανοήσουμε έναν bootloader πρέπει πρώτα να κατανοήσουμε το \textbf{Real Mode}.
+
+Όταν ο υπολογιστής ενεργοποιείται, ο x86 επεξεργαστής εισέρχεται αυτόματα σε Real Mode. Το Real Mode
+διατηρείται για λόγους \textbf{backward compatibility} και σήμερα θεωρείται ιστορικά απαραίτητο αλλά
+ακατάλληλο για σύγχρονα OS.
+
+\subsection{16-bit εκτέλεση}
+
+Στο Real Mode, ο επεξεργαστής εκτελεί από προεπιλογή σε \textbf{16-bit} περιβάλλον. Παρότι νεότερες
+CPU επιτρέπουν πρόσβαση σε 32-bit registers, για αρχικά/εκπαιδευτικά παραδείγματα αποφεύγουμε να
+χτίζουμε σχεδιασμό πάνω σε αυτό, εκτός από την ίδια τη μετάβαση σε Protected Mode.
+
+\subsection{20-bit φυσική διευθυνσιοδότηση: Segment:Offset}
+
+Στο Real Mode, οι διευθύνσεις μνήμης αναφέρονται σε \textbf{φυσικές} διευθύνσεις, μέσω του σχήματος:
+
+\[
+PA = Segment \cdot 16 + Offset
+\]
+
+όπου:
+\begin{itemize}
+    \item το \textbf{Segment} προέρχεται από 16-bit segment register,
+    \item το \textbf{Offset} προέρχεται από 16-bit address register.
+\end{itemize}
+
+Με αυτό το μοντέλο μπορούμε να περιγράψουμε διευθύνσεις μέχρι λίγο κάτω από \textbf{1MiB}.
+Επιπλέον, υπάρχουν \textbf{πολλαπλοί τρόποι} να περιγράψουμε την ίδια φυσική διεύθυνση (π.χ. ένα PA
+μπορεί να γραφτεί ως διαφορετικά segment/offset ζεύγη).
+
+\subsection{Γιατί το Real Mode είναι ανεπαρκές για σύγχρονα συστήματα}
+
+Εφόσον μιλάμε για φυσικές διευθύνσεις και δεν υπάρχει προστασία, \textbf{καμία διεργασία δεν
+απαγορεύεται} από το να προσπελάσει οποιοδήποτε κομμάτι μνήμης. Αυτό καθιστά δύσκολη:
+\begin{itemize}
+    \item την προστασία κρίσιμων δεδομένων,
+    \item τον ορισμό ownership της μνήμης,
+    \item την απομόνωση προγραμμάτων.
+\end{itemize}
+
+Σύγχρονες προσεγγίσεις λύνουν αυτό το πρόβλημα με \textbf{virtual memory} (π.χ. paging).
+Με virtual addresses, το OS χαρτογραφεί κάθε virtual διεύθυνση σε φυσική, εξασφαλίζοντας ότι
+κάθε πρόγραμμα “βλέπει” το δικό του χώρο και δεν μπορεί να προσπελάσει άλλον.
+
+\begin{info}[Σημείωση]
+Στο βιβλίο του Skyl-OS η κύρια προσέγγιση μνήμης είναι virtual memory μέσω paging (θα καλυφθεί αργότερα),
+αλλά στο παρόν κεφάλαιο χρησιμοποιούμε Protected Mode για να προετοιμάσουμε την εκτέλεση 32-bit kernel code.
+\end{info}
+
+Η ύπαρξη του Real Mode οδηγεί ιστορικά στη δημιουργία ενός δεύτερου CPU mode: \textbf{Protected Mode},
+στο οποίο ανοίγουν δρόμοι για segmentation με privileges (ring levels), και τελικά για πιο ασφαλή
+διαχείριση μνήμης.
+
+%----------------------------------------------------------------------------------------
+%   2.2 ROLE OF BOOTLOADER / MBR
+%----------------------------------------------------------------------------------------
+
+\section{Ο ρόλος του Bootloader και το MBR}
+
+\subsection{BIOS $\rightarrow$ Bootloader}
+
+Το πρώτο πρόγραμμα που αναλαμβάνει τον έλεγχο κατά το boot είναι το BIOS.
+Μεταξύ άλλων, το BIOS εντοπίζει συσκευή εκκίνησης και \textbf{διαβάζει τα πρώτα 512 bytes} της
+συσκευής (MBR: Master Boot Record).
+
+Αν τα \textbf{τελευταία 2 bytes} του MBR είναι η υπογραφή \textbf{0x55AA}, το BIOS θεωρεί τη συσκευή
+bootable και μεταφέρει τον έλεγχο στον Stage-1 bootloader.
+
+\begin{file}[MBR Signature (Snippet)]
+\footnotesize \begin{lstlisting}[language={[x86masm]Assembler}, tabsize=2]
+times 510 - ($ - $$) db 0
+dw 0xAA55
+\end{lstlisting}
+\end{file}
+
+\subsection{Πού φορτώνεται ο bootloader;}
+
+Το BIOS φορτώνει τον bootloader στη διεύθυνση \src{0x7C00}. Αυτό είναι ιστορική σύμβαση.
+Οι bootloader developers το \textbf{υποθέτουν} για συμβατότητα, και η διεύθυνση είναι πρακτική:
+είναι κάτω από το 1MiB και αφήνει χώρο χαμηλότερα για δομές όπως interrupt vectors (που θα δούμε σε άλλα labs).
+
+\subsection{Δομή MBR}
+
+Το MBR έχει κλασικά:
+\begin{itemize}
+    \item 446 bytes boot code (Stage-1),
+    \item 64 bytes partition table (4 entries $\times$ 16 bytes),
+    \item 2 bytes signature.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \begin{tabular}{|l|l|l|}
+        \hline
+        \textbf{Region} & \textbf{Offset (bytes)} & \textbf{Notes} \\
+        \hline
+        Boot code \& data & 0x000--0x1BD & 446 B (Stage-1) \\
+        \hline
+        Partition table entry \#1 & 0x1BE--0x1CD & 16 B \\
+        \hline
+        Partition table entry \#2 & 0x1CE--0x1DD & 16 B \\
+        \hline
+        Partition table entry \#3 & 0x1DE--0x1ED & 16 B \\
+        \hline
+        Partition table entry \#4 & 0x1EE--0x1FD & 16 B \\
+        \hline
+        Boot signature & 0x1FE--0x1FF & 2 B (0x55AA) \\
+        \hline
+    \end{tabular}
+    \caption{Master Boot Record (512 bytes) layout.}
+    \label{fig:mbr_layout}
+\end{figure}
+
+\subsection{Τι κάνουν τα “advanced” συστήματα;}
+
+Σε πιο πλήρη OS:
+\begin{enumerate}
+    \item Stage-1 διαβάζει το partition table,
+    \item βρίσκει το active/bootable partition,
+    \item φορτώνει το Volume Boot Record (VBR) του partition,
+    \item το οποίο γνωρίζει για filesystem και οδηγεί σε επόμενο στάδιο bootloading.
+\end{enumerate}
+
+\begin{info}[Σημείωση]
+Για λόγους απλότητας, στο παρόν κεφάλαιο/εργαστήριο υποθέτουμε ότι ο Stage-1 φορτώνει τον kernel απευθείας
+(χωρίς filesystem parsing).
+\end{info}
+
+\subsection{Σύντομη εικόνα partition entry}
+
+Κάθε entry περιέχει πληροφορίες όπως: bootable flag, CHS start/end (legacy), type, First LBA και total sectors.
+(Τα CHS/LBA θα μας απασχολήσουν στη συνέχεια.)
+
+%----------------------------------------------------------------------------------------
+%   2.3 BIOS INTERRUPTS
+%----------------------------------------------------------------------------------------
+
+\section{Αξιοποίηση BIOS Interrupts}
+
+Για να φορτώσουμε kernel, πρέπει να μπορούμε να κάνουμε I/O πριν έχουμε δικούς μας drivers.
+Το BIOS προσφέρει ένα σύνολο interrupts για βασικές λειτουργίες (disk, screen, keyboard).
+
+\subsection{Γιατί interrupts;}
+
+Τα interrupts λειτουργούν ως \textbf{ελεγχόμενη διεπαφή} προς κρίσιμες λειτουργίες hardware.
+Αυτό:
+\begin{itemize}
+    \item απλοποιεί ανάπτυξη (δεν γράφουμε driver στο bootloader),
+    \item αποσυνδέει τον κώδικα από hardware λεπτομέρειες,
+    \item επιτρέπει έλεγχο παραμέτρων πριν την εκτέλεση (σημαντικό για ασφάλεια).
+\end{itemize}
+
+\subsection{Παράδειγμα: Εκτύπωση χαρακτήρα με INT 0x10}
+
+\begin{file}[BIOS Video: Teletype Output (Snippet)]
+\footnotesize \begin{lstlisting}[language={[x86masm]Assembler}, tabsize=2]
+mov ah, 0x0E  ; teletype output function
+mov al, 'A'   ; ASCII char
+mov bh, 0x00  ; page
+mov bl, 0x07  ; color
+int 0x10
+\end{lstlisting}
+\end{file}
+
+%----------------------------------------------------------------------------------------
+%   2.4 LBA vs CHS
+%----------------------------------------------------------------------------------------
+
+\section{LBA vs CHS Addressing}
+
+Πριν φορτώσουμε kernel από δίσκο, πρέπει να κατανοήσουμε το legacy μοντέλο διευθυνσιοδότησης \textbf{CHS}
+(Cylinder-Head-Sector), το οποίο “αντικατοπτρίζει” την γεωμετρία των παραδοσιακών σκληρών δίσκων.
+
+\subsection{Γεωμετρική ιδέα: platters, heads, tracks, sectors}
+
+Οι δίσκοι αποτελούνται από \textbf{platters} (κυκλικοί δίσκοι). Σε κάθε επιφάνεια platter γράφει ένας \textbf{head}.
+Άρα, για N platters έχουμε 2N heads.
+
+Φανταστείτε νοητούς \textbf{cylinders} με κοινό κέντρο. Η τομή ενός cylinder με μια επιφάνεια platter είναι ένα \textbf{track}.
+Κάθε track χωρίζεται σε \textbf{sectors}, και το sector είναι το μικρότερο addressable unit (συνήθως 512 bytes).
+
+\subsection{CHS $\rightarrow$ 512-byte units}
+
+Για να προσπελάσουμε δεδομένα, δίνουμε:
+\begin{itemize}
+    \item Cylinder,
+    \item Head,
+    \item Sector (με αρίθμηση που ξεκινά από 1).
+\end{itemize}
+
+Κάθε συνδυασμός CHS αντιστοιχεί σε 512-byte block (και πρακτικά αντιστοιχεί σε ένα LBA block).
+
+\subsection{Τυπικά όρια BIOS CHS}
+
+\begin{itemize}
+    \item 1024 cylinders (0--1023, 10 bits)
+    \item 256 heads (0--255, 8 bits)
+    \item 63 sectors (1--63, 6 bits, 1-based)
+    \item 512 bytes per sector
+\end{itemize}
+
+Το CHS περιορίζεται περίπου στα \textbf{8.4 GiB} και έχει αντικατασταθεί από LBA, όμως το BIOS ακόμη το προσφέρει.
+Επιπλέον, σύγχρονοι δίσκοι δεν εκθέτουν πραγματική γεωμετρία και χρησιμοποιούν emulation layer.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.5\textwidth]{images/CHS_Figure.png}
+    \caption{CHS addressing layout: cylinders, heads, and sectors.}
+    \label{fig:chs_layout}
+\end{figure}
+
+%----------------------------------------------------------------------------------------
+%   2.5 LOADING THE KERNEL
+%----------------------------------------------------------------------------------------
+
+\section{Loading the Kernel}
+
+Ξεκινάμε “ρίχνοντας” λίγο κώδικα. Μην σας αγχώσει: ακολουθεί ανάλυση γραμμή-γραμμή.
+
+\subsection{Απλό start bootloader}
+
+\begin{file}[bootloader.asm (Snippet)]
+\footnotesize \begin{lstlisting}[language={[x86masm]Assembler}, tabsize=2]
+[ORG 0x7C00]    ; BIOS loads bootloader here
+[BITS 16]       ; start in 16-bit Real Mode
+
+start:
+    cli
+
+    mov ax, 0x0700
+    mov ss, ax
+    mov sp, 0x0000
+
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+
+    mov ah, 0x02
+    mov al, 1
+    mov ch, 0
+    mov cl, 2
+    mov dh, 0
+    mov dl, 0x80
+    mov bx, 0x1000
+    mov es, bx
+    xor bx, bx
+
+    int 0x13
+\end{lstlisting}
+\end{file}
+
+\subsection{Ανάλυση: γιατί cli;}
+
+Το \src{cli} απενεργοποιεί maskable interrupts. Εφόσον \textbf{δεν έχουμε στήσει interrupt handling}
+ακόμη, ένα interrupt σε λάθος στιγμή μπορεί να καταστρέψει την εκτέλεση.
+
+\subsection{Ανάλυση: stack σε Real Mode}
+
+Θέτουμε \src{SS=0x0700} και \src{SP=0x0000}. Η φυσική διεύθυνση stack γίνεται:
+
+\[
+PA = 0x0700 \cdot 16 + 0x0000 = 0x7000
+\]
+
+Το \src{0x7000} επιλέγεται ώστε να είναι \textbf{πάνω από 512 bytes κάτω} από το \src{0x7C00}, όπου βρίσκεται ο bootloader,
+ώστε να μειώσουμε πιθανότητα επικάλυψης.
+
+\begin{info}[Σημείωση]
+Το bootloader μπορεί “να φαίνεται” ότι δουλεύει χωρίς το πλήρες setup, αλλά χωρίς stack setup και χωρίς μηδενισμό
+registers (\src{AX, DS, ES}) το περιβάλλον γίνεται απρόβλεπτο.
+\end{info}
+
+\subsection{Ανάγνωση sectors: INT 0x13 (AH=0x02)}
+
+Με την κλήση \src{int 0x13} ζητάμε από το BIOS να φορτώσει δεδομένα από δίσκο σε μνήμη.
+Πριν καλέσουμε το interrupt πρέπει να περάσουμε παραμέτρους μέσω registers.
+
+\begin{figure}[H]
+    \centering
+    \begin{tabular}{|l|l|l|}
+        \hline
+        \textbf{Register} & \textbf{Purpose} & \textbf{Value Used} \\
+        \hline
+        AH & BIOS function number & 0x02 (read sectors) \\
+        \hline
+        AL & Number of sectors to read & 1 \\
+        \hline
+        CH & Cylinder (part 1) & 0 \\
+        \hline
+        CL & Sector (bits 0--5) + cyl high bits (6--7) & 2 \\
+        \hline
+        DH & Head & 0 \\
+        \hline
+        DL & Drive & 0x80 (first hard drive) \\
+        \hline
+        ES:BX & Destination segment:offset & 0x1000:0x0000 (= 0x10000) \\
+        \hline
+    \end{tabular}
+    \caption{INT 0x13, AH=0x02 — Disk Read BIOS Call Parameters}
+    \label{fig:int13_params}
+\end{figure}
+
+Σημεία προσοχής:
+\begin{itemize}
+    \item Ο τομέας 1 περιέχει bootloader, άρα ξεκινάμε από \textbf{sector 2}.
+    \item Τα 2 high bits του cylinder βρίσκονται στα bits 6--7 του \src{CL}.
+    \item \src{DL}: 0x00--0x7F floppy, 0x80+ hard drives.
+    \item Το \src{ES:BX} είναι ο στόχος στη μνήμη (Real Mode addressing).
+\end{itemize}
+
+\subsection{Έλεγχος αποτυχίας: carry flag}
+
+Το BIOS υποδεικνύει error θέτοντας carry flag. Άρα κάνουμε \src{jc} σε error handler.
+
+\begin{file}[disk\_read.asm (Snippet)]
+\footnotesize \begin{lstlisting}[language={[x86masm]Assembler}, tabsize=2]
+int 0x13
+jc disk_error
+
+disk_error:
+    mov ah, 0x0E
+    mov al, 'E'
+    int 0x10
+    hlt
+\end{lstlisting}
+\end{file}
+
+Ο handler τυπώνει ‘E’ με BIOS video teletype και μετά κάνει \src{hlt}.
+
+%----------------------------------------------------------------------------------------
+%   2.6 PROTECTED MODE
+%----------------------------------------------------------------------------------------
+
+\section{Entering Protected Mode}
+
+Πριν κάνουμε jump στον kernel, αλλάζουμε CPU mode από Real Mode σε \textbf{Protected Mode}.
+Τυπικά:
+\begin{itemize}
+    \item Δεν είναι “απόλυτη” απαίτηση για κάθε kernel,
+    \item αλλά στην πράξη \textbf{σύγχρονοι C compilers} παράγουν \textbf{32-bit binaries},
+    \item και σε Protected Mode αποκτούμε πρόσβαση σε έως \textbf{4GiB} address space.
+\end{itemize}
+
+Για να μπούμε σε Protected Mode, η x86 απαιτεί να έχει περιγραφεί layout μνήμης μέσω \textbf{GDT}
+(Global Descriptor Table). Οι segment selectors χρησιμοποιούν τη GDT για να βρουν τα segments.
+
+\begin{info}[Σημείωση]
+Στο Skyl-OS αργότερα χρησιμοποιείται paging (virtual memory) ως κύρια διαχείριση μνήμης.
+Στο παρόν σημείο, η GDT ορίζεται “απλά” ώστε να ικανοποιηθεί η απαίτηση της CPU, με overlapping code/data segments.
+\end{info}
+
+\subsection{Ορισμός απλής GDT}
+
+\begin{file}[gdt.asm (Snippet)]
+\footnotesize \begin{lstlisting}[language={[x86masm]Assembler}, tabsize=2]
+gdt_start:
+    dq 0x0000000000000000 ; null descriptor
+    dq 0x00CF9A000000FFFF ; code segment
+    dq 0x00CF92000000FFFF ; data segment
+gdt_end:
+
+gdt_desc:
+    dw gdt_end - gdt_start - 1
+    dd gdt_start
+\end{lstlisting}
+\end{file}
+
+\subsection{Φόρτωση GDT και ενεργοποίηση Protected Mode}
+
+\begin{file}[protected\_mode.asm (Snippet)]
+\footnotesize \begin{lstlisting}[language={[x86masm]Assembler}, tabsize=2]
+lgdt [gdt_desc]
+
+mov eax, cr0
+or eax, 1
+mov cr0, eax
+
+jmp 0x08:protected_mode_start
+\end{lstlisting}
+\end{file}
+
+Μετά την ενεργοποίηση του PE bit στο \src{CR0}, κάνουμε far jump σε code segment selector (0x08) και label που
+τρέχει σε 32-bit mode. (Το “πώς/γιατί” του far jump θα αναλυθεί σε επόμενα κεφάλαια.)
+
+\subsection{BITS 32 και jump στον kernel}
+
+\begin{file}[jump\_to\_kernel.asm (Snippet)]
+\footnotesize \begin{lstlisting}[language={[x86masm]Assembler}, tabsize=2]
+[BITS 32]
+protected_mode_start:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+
+    jmp 0x08:0x10000
+\end{lstlisting}
+\end{file}
+
+Η διεύθυνση \src{0x10000} είναι εκεί που φορτώσαμε τον kernel νωρίτερα μέσω \src{INT 0x13}.
+
+%----------------------------------------------------------------------------------------
+%   DEVELOPMENT ENVIRONMENT (Lab-style)
+%----------------------------------------------------------------------------------------
+
+\section{Προετοιμασία περιβάλλοντος ανάπτυξης}
+
+Αν δεν χρησιμοποιείτε Debian-based Linux, προτείνεται virtual machine.
+
+\subsection{Απαραίτητα Πακέτα}
+
+\begin{commandline}
+\begin{verbatim}
+$ sudo apt-get update
+$ sudo apt-get install build-essential nasm qemu-system-x86 git
+\end{verbatim}
+\end{commandline}
+
+\subsection{Λήψη πηγαίου κώδικα}
+
+Ο κώδικας του Skyl-OS βρίσκεται στο GitHub.
+
+\begin{commandline}
+\begin{verbatim}
+$ git clone https://github.com/Billyzeim/Skyl-OS.git
+$ cd Skyl-OS
+\end{verbatim}
+\end{commandline}
+
+\begin{info}[Σημείωση]
+Αν έχει δοθεί συγκεκριμένο branch για το bootloader lab από τους διδάσκοντες, κάντε checkout σε αυτό.
+\end{info}
+
+\subsection{Compilation και εκτέλεση}
+
+\begin{commandline}
+\begin{verbatim}
+$ make run
+\end{verbatim}
+\end{commandline}
+
+%----------------------------------------------------------------------------------------
+%   EXERCISES (ALL IN ONE PLACE, QUESTIONS ONLY)
+%----------------------------------------------------------------------------------------
+
+\section{Ασκήσεις}
+
+\begin{question}
+\textbf{Άσκηση 1}\\
+Εξηγήστε γιατί ορίζουμε την αρχή του stack στη θέση μνήμης \src{0x7000}. Τι θα γινόταν αν αλλάζαμε αυτή την τιμή σε \src{0x8000};\\
+\textbf{Υπόδειξη:} Δείτε Section 5 (Loading the Kernel), υποενότητες για stack setup.
+\end{question}
+
+\begin{question}
+\textbf{Άσκηση 2}\\
+Ο bootloader δεν δουλεύει καθώς ο αριθμός των bytes που φορτώνουμε από τον δίσκο δεν είναι σωστός.
+Βρείτε ποιος είναι ο σωστός αριθμός και διορθώστε τον κώδικα ώστε να τρέχει.\\
+\textbf{Υπόδειξη:} Συνδέστε “sectors” $\times$ 512 bytes (Section 5) και τη λογική “φόρτωσε τον kernel σε blocks”.
+\end{question}
+
+\begin{question}
+\textbf{Άσκηση 3}\\
+Γιατί χρειαζόμαστε μερικές φορές δεύτερο στάδιο bootloader;\\
+\textbf{Υπόδειξη:} Δείτε Section 3 (MBR) για τα όρια 512 bytes, Stage-1, partition table, VBR.
+\end{question}
+
+\begin{question}
+\textbf{Άσκηση 4}\\
+Ποιοί είναι οι περιορισμοί του Real Mode;\\
+\textbf{Υπόδειξη:} Δείτε Section 2 (Real Mode) και τη συζήτηση για φυσικές διευθύνσεις/έλλειψη προστασίας.
+\end{question}
+
+%----------------------------------------------------------------------------------------
+%   DELIVERABLES
+%----------------------------------------------------------------------------------------
+
+\section{Παραδοτέα}
+
+Συντάξτε μία αναφορά σε \src{pdf} που θα περιέχει:
+\begin{itemize}
+    \item απαντήσεις στις θεωρητικές ερωτήσεις (χωρίς μεγάλα dumps κώδικα),
+    \item τα σημεία του κώδικα που αλλάξατε και σύντομη αιτιολόγηση,
+    \item (προαιρετικά) screenshots/serial output που δείχνουν ότι τρέχει.
+\end{itemize}
+
+Υποβάλετε επίσης ένα \src{zip} (π.χ. upAM.zip) με τα αρχεία που τροποποιήσατε.
+
+Καλή επιτυχία!
+
+\section*{Περισσότερες Πηγές}
+
+\begin{itemize}
+    \item \href{https://wiki.osdev.org/Boot_Sequence}{OSDev Wiki - BIOS Boot Process}
+    \item \href{https://wiki.osdev.org/Protected_mode}{OSDev Wiki - Protected Mode}
+    \item \href{https://wiki.osdev.org/MBR_(x86)}{OSDev Wiki - MBR (x86)}
+    \item \href{https://wiki.osdev.org/GDT}{OSDev Wiki - GDT}
+\end{itemize}
+
+\end{document}
